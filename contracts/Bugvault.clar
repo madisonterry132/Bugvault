@@ -11,6 +11,10 @@
 (define-constant ERR_CANNOT_RATE_SELF (err u109))
 (define-constant ERR_ALREADY_RATED (err u110))
 (define-constant ERR_NO_INTERACTION (err u111))
+(define-constant ERR_BOUNTY_NOT_MULTI (err u112))
+(define-constant ERR_INSUFFICIENT_REWARD_POOL (err u113))
+(define-constant ERR_MAX_WINNERS_REACHED (err u114))
+(define-constant ERR_INVALID_DISTRIBUTION (err u115))
 
 (define-data-var next-bounty-id uint u1)
 (define-data-var next-submission-id uint u1)
@@ -25,7 +29,10 @@
     reward: uint,
     deadline: uint,
     status: (string-ascii 20),
-    winner: (optional principal)
+    winner: (optional principal),
+    is-multi-submission: bool,
+    max-winners: uint,
+    reward-per-winner: uint
   }
 )
 
@@ -89,6 +96,23 @@
   { bounty-ids: (list 50 uint) }
 )
 
+(define-map multi-bounty-winners
+  { bounty-id: uint }
+  { 
+    winners: (list 20 principal),
+    total-paid: uint,
+    winner-count: uint
+  }
+)
+
+(define-map bounty-winner-rewards
+  { bounty-id: uint, winner: principal }
+  { 
+    reward-amount: uint,
+    payout-timestamp: uint
+  }
+)
+
 (define-public (create-bounty (title (string-ascii 100)) (description (string-ascii 500)) (reward uint) (duration uint))
   (let
     (
@@ -106,7 +130,10 @@
         reward: reward,
         deadline: deadline,
         status: "active",
-        winner: none
+        winner: none,
+        is-multi-submission: false,
+        max-winners: u1,
+        reward-per-winner: reward
       }
     )
     (map-set bounty-funds { bounty-id: bounty-id } { amount: reward })
@@ -444,3 +471,203 @@
 (define-read-only (get-next-rating-id)
   (var-get next-rating-id)
 )
+
+(define-public (create-multi-bounty (title (string-ascii 100)) (description (string-ascii 500)) (total-reward uint) (duration uint) (max-winners uint) (reward-per-winner uint))
+  (let
+    (
+      (bounty-id (var-get next-bounty-id))
+      (deadline (+ stacks-block-height duration))
+      (required-funds (* max-winners reward-per-winner))
+    )
+    (asserts! (> total-reward u0) ERR_INVALID_AMOUNT)
+    (asserts! (> max-winners u1) ERR_INVALID_AMOUNT)
+    (asserts! (> reward-per-winner u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= max-winners u20) ERR_INVALID_AMOUNT)
+    (asserts! (>= total-reward required-funds) ERR_INSUFFICIENT_REWARD_POOL)
+    (try! (stx-transfer? total-reward tx-sender (as-contract tx-sender)))
+    (map-set bounties
+      { bounty-id: bounty-id }
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        reward: total-reward,
+        deadline: deadline,
+        status: "active",
+        winner: none,
+        is-multi-submission: true,
+        max-winners: max-winners,
+        reward-per-winner: reward-per-winner
+      }
+    )
+    (map-set bounty-funds { bounty-id: bounty-id } { amount: total-reward })
+    (map-set user-bounties { creator: tx-sender, bounty-id: bounty-id } { exists: true })
+    (map-set multi-bounty-winners 
+      { bounty-id: bounty-id } 
+      { winners: (list), total-paid: u0, winner-count: u0 }
+    )
+    (var-set next-bounty-id (+ bounty-id u1))
+    (unwrap-panic (update-user-reputation-on-bounty-create tx-sender))
+    (ok bounty-id)
+  )
+)
+
+(define-public (approve-multi-submission (bounty-id uint) (submission-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (submission (unwrap! (map-get? submissions { submission-id: submission-id }) ERR_NOT_FOUND))
+      (multi-winners (unwrap! (map-get? multi-bounty-winners { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (bounty-fund (unwrap! (map-get? bounty-funds { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (reward-amount (get reward-per-winner bounty))
+      (current-winner-count (get winner-count multi-winners))
+      (submitter (get submitter submission))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (get is-multi-submission bounty) ERR_BOUNTY_NOT_MULTI)
+    (asserts! (is-eq (get bounty-id submission) bounty-id) ERR_NOT_FOUND)
+    (asserts! (< current-winner-count (get max-winners bounty)) ERR_MAX_WINNERS_REACHED)
+    (asserts! (>= (get amount bounty-fund) reward-amount) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (is-none (map-get? bounty-winner-rewards { bounty-id: bounty-id, winner: submitter })) ERR_ALREADY_EXISTS)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender submitter)))
+    (let
+      (
+        (updated-winners (unwrap! (as-max-len? (append (get winners multi-winners) submitter) u20) ERR_MAX_WINNERS_REACHED))
+        (new-total-paid (+ (get total-paid multi-winners) reward-amount))
+        (new-winner-count (+ current-winner-count u1))
+        (remaining-funds (- (get amount bounty-fund) reward-amount))
+      )
+      (map-set multi-bounty-winners
+        { bounty-id: bounty-id }
+        { 
+          winners: updated-winners,
+          total-paid: new-total-paid,
+          winner-count: new-winner-count
+        }
+      )
+      (map-set bounty-winner-rewards
+        { bounty-id: bounty-id, winner: submitter }
+        { 
+          reward-amount: reward-amount,
+          payout-timestamp: stacks-block-height
+        }
+      )
+      (map-set submissions
+        { submission-id: submission-id }
+        (merge submission { status: "approved" })
+      )
+      (map-set bounty-funds { bounty-id: bounty-id } { amount: remaining-funds })
+      (unwrap-panic (update-user-reputation-on-submission-approve submitter (get creator bounty)))
+      (unwrap-panic (record-user-interaction (get creator bounty) submitter bounty-id))
+      (if (>= new-winner-count (get max-winners bounty))
+        (map-set bounties
+          { bounty-id: bounty-id }
+          (merge bounty { status: "completed" })
+        )
+        true
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (finalize-multi-bounty (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (bounty-fund (unwrap! (map-get? bounty-funds { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (remaining-amount (get amount bounty-fund))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (get is-multi-submission bounty) ERR_BOUNTY_NOT_MULTI)
+    (if (> remaining-amount u0)
+      (try! (as-contract (stx-transfer? remaining-amount tx-sender (get creator bounty))))
+      true
+    )
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { status: "completed" })
+    )
+    (map-delete bounty-funds { bounty-id: bounty-id })
+    (ok true)
+  )
+)
+
+(define-public (extend-multi-bounty-pool (bounty-id uint) (additional-funds uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (bounty-fund (unwrap! (map-get? bounty-funds { bounty-id: bounty-id }) ERR_NOT_FOUND))
+      (current-amount (get amount bounty-fund))
+      (new-total (+ current-amount additional-funds))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (get is-multi-submission bounty) ERR_BOUNTY_NOT_MULTI)
+    (asserts! (> additional-funds u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? additional-funds tx-sender (as-contract tx-sender)))
+    (map-set bounty-funds { bounty-id: bounty-id } { amount: new-total })
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { reward: (+ (get reward bounty) additional-funds) })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-multi-bounty-winners (bounty-id uint))
+  (map-get? multi-bounty-winners { bounty-id: bounty-id })
+)
+
+(define-read-only (get-bounty-winner-reward (bounty-id uint) (winner principal))
+  (map-get? bounty-winner-rewards { bounty-id: bounty-id, winner: winner })
+)
+
+(define-read-only (is-multi-submission-bounty (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty (get is-multi-submission bounty)
+    false
+  )
+)
+
+(define-read-only (get-remaining-winner-slots (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty 
+      (if (get is-multi-submission bounty)
+        (match (map-get? multi-bounty-winners { bounty-id: bounty-id })
+          winners (- (get max-winners bounty) (get winner-count winners))
+          (get max-winners bounty)
+        )
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (calculate-potential-earnings (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty 
+      (if (get is-multi-submission bounty)
+        (let
+          (
+            (remaining-slots (get-remaining-winner-slots bounty-id))
+            (reward-per-winner (get reward-per-winner bounty))
+          )
+          (* remaining-slots reward-per-winner)
+        )
+        (get reward bounty)
+      )
+    u0
+  )
+)
+
+(define-read-only (has-user-won-multi-bounty (bounty-id uint) (user principal))
+  (match (map-get? multi-bounty-winners { bounty-id: bounty-id })
+    winners (is-some (index-of (get winners winners) user))
+    false
+  )
+)
+
+
